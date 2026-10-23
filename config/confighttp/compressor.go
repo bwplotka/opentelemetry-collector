@@ -99,7 +99,12 @@ func newWriteCloserResetFunc(compressionType configcompression.Type, compression
 
 func (p *compressor) compress(buf *bytes.Buffer, body io.ReadCloser) error {
 	writer := p.pool.Get().(writeCloserReset)
-	defer p.pool.Put(writer)
+	defer func() {
+		// Detach the underlying buffer before returning the writer to the pool so the pooled
+		// compressor does not retain the request buffer across GC cycles.
+		writer.Reset(nil)
+		p.pool.Put(writer)
+	}()
 	writer.Reset(buf)
 
 	if body != nil {

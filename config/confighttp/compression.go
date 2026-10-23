@@ -36,7 +36,38 @@ type compressRoundTripper struct {
 	compressor        *compressor
 }
 
-var zstdReaderPool sync.Pool
+var (
+	gzipReaderPool      sync.Pool
+	zstdReaderPool      sync.Pool
+	errGzipReaderClosed = errors.New("gzip: reader closed")
+)
+
+type pooledGzipReader struct {
+	gr *gzip.Reader
+	br *bufio.Reader
+}
+
+type pooledGzipReadCloser struct {
+	inner *pooledGzipReader
+}
+
+func (pgrc *pooledGzipReadCloser) Read(dst []byte) (int, error) {
+	if pgrc.inner == nil {
+		return 0, errGzipReaderClosed
+	}
+	return pgrc.inner.gr.Read(dst)
+}
+
+func (pgrc *pooledGzipReadCloser) Close() error {
+	if pgrc.inner != nil {
+		err := pgrc.inner.gr.Close()
+		pgrc.inner.br.Reset(nil)
+		gzipReaderPool.Put(pgrc.inner)
+		pgrc.inner = nil
+		return err
+	}
+	return nil
+}
 
 type pooledZstdReadCloser struct {
 	inner *zstd.Decoder
@@ -67,11 +98,26 @@ var availableDecoders = map[string]func(body io.ReadCloser) (io.ReadCloser, erro
 		return nil, nil
 	},
 	"gzip": func(body io.ReadCloser) (io.ReadCloser, error) {
-		gr, err := gzip.NewReader(body)
-		if err != nil {
-			return nil, err
+		var r *pooledGzipReader
+		if v := gzipReaderPool.Get(); v == nil {
+			// Pass a pooled bufio.Reader (which implements flate.Reader) to gzip.Reader so
+			// gzip.Reader.Reset does not allocate a new 4KB bufio.Reader on every request.
+			br := bufio.NewReader(body)
+			gr, err := gzip.NewReader(br)
+			if err != nil {
+				return nil, err
+			}
+			r = &pooledGzipReader{gr: gr, br: br}
+		} else {
+			r = v.(*pooledGzipReader)
+			r.br.Reset(body)
+			if err := r.gr.Reset(r.br); err != nil {
+				r.br.Reset(nil)
+				gzipReaderPool.Put(r)
+				return nil, err
+			}
 		}
-		return gr, nil
+		return &pooledGzipReadCloser{inner: r}, nil
 	},
 	"zstd": func(body io.ReadCloser) (io.ReadCloser, error) {
 		v := zstdReaderPool.Get()

@@ -1069,6 +1069,77 @@ func TestPooledZstdReadCloserReadAfterClose(t *testing.T) {
 	assert.Empty(t, resp.Body.String(), "Must match the returned string")
 }
 
+func TestPooledGzipReadCloserReadAfterClose(t *testing.T) {
+	h := httpContentDecompressor(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			buf := make([]byte, 1024)
+			_, err := r.Body.Read(buf)
+			assert.NoError(t, err)
+			err = r.Body.Close()
+			assert.NoError(t, err)
+			_, err = r.Body.Read(buf)
+			assert.ErrorIs(t, err, errGzipReaderClosed)
+			w.WriteHeader(http.StatusBadRequest)
+		}),
+		defaultMaxRequestBodySize,
+		defaultErrorHandler,
+		defaultCompressionAlgorithms(),
+		availableDecoders,
+	)
+
+	payload := compressGzip(t, make([]byte, 2*1024))
+	assert.NotEmpty(t, payload.Bytes(), "Must have data available")
+
+	req := httptest.NewRequest(http.MethodPost, "/", payload)
+	req.Header.Set("Content-Encoding", "gzip")
+
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusBadRequest, resp.Code, "Must match the expected code")
+	assert.Empty(t, resp.Body.String(), "Must match the returned string")
+}
+
+// Recommended CLI invocation:
+//
+//	export bench=decompress-before && go test . -run '^$' -bench '^BenchmarkHTTPContentDecompression' -benchtime 1s -count 6 -cpu 2 -timeout 999m -benchmem | tee ${bench}.txt
+func BenchmarkHTTPContentDecompression(b *testing.B) {
+	rawPayload := bytes.Repeat([]byte("metric_name{label=\"value\",instance=\"localhost:8080\"} 123.45\n"), 128)
+	gzipPayload := compressGzip(b, rawPayload).Bytes()
+	zstdPayload := compressZstd(b, rawPayload).Bytes()
+
+	for _, tc := range []struct {
+		name     string
+		encoding string
+		payload  []byte
+	}{
+		{name: "encoding=gzip", encoding: "gzip", payload: gzipPayload},
+		{name: "encoding=zstd", encoding: "zstd", payload: zstdPayload},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			decoder := availableDecoders[tc.encoding]
+			var reader bytes.Reader
+			body := io.NopCloser(&reader)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(rawPayload)))
+			b.ResetTimer()
+			for b.Loop() {
+				reader.Reset(tc.payload)
+				rc, err := decoder(body)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := io.Copy(io.Discard, rc); err != nil {
+					b.Fatal(err)
+				}
+				if err := rc.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 type closeTrackingReadCloser struct {
 	io.Reader
 	closed bool
